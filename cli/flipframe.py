@@ -90,6 +90,55 @@ def fetch_weather():
         return json.loads(resp.read().decode())
 
 
+GRID_COLS = 22
+GRID_ROWS = 11
+
+
+def pad_center(text, width):
+    """Center text in a field of given width."""
+    text = text[:width]
+    pad = width - len(text)
+    left = pad // 2
+    return " " * left + text + " " * (width - left - len(text))
+
+
+def side_by_side(left, right, col_width=11):
+    """Place two strings side by side in the grid."""
+    l = pad_center(left[:col_width], col_width)
+    r = pad_center(right[:col_width], col_width)
+    return l + r
+
+
+# Abbreviations for weather descriptions that exceed 11 chars
+DESC_SHORT = {
+    "LIGHT SHOWERS": "LT SHOWERS",
+    "HEAVY SHOWERS": "HVY SHOWERS",
+    "LIGHT DRIZZLE": "LT DRIZZLE",
+    "HEAVY DRIZZLE": "HVY DRIZZLE",
+    "LIGHT RAIN": "LIGHT RAIN",
+    "HEAVY RAIN": "HEAVY RAIN",
+    "FREEZING FOG": "FRZNG FOG",
+    "FREEZING RAIN": "FRZNG RAIN",
+    "FREEZING DRIZZLE": "FRZNG DRZL",
+    "HEAVY FREEZING DRIZZLE": "HVY FRZ DRZ",
+    "HEAVY FREEZING RAIN": "HVY FRZ RN",
+    "LIGHT SNOW SHOWERS": "LT SNOW SHW",
+    "HEAVY SNOW SHOWERS": "HVY SNW SHW",
+    "THUNDERSTORM W/ HAIL": "T-STRM HAIL",
+    "SEVERE THUNDERSTORM": "SVR T-STORM",
+    "THUNDERSTORM": "T-STORM",
+    "PARTLY CLOUDY": "PTLY CLOUDY",
+    "MAINLY CLEAR": "MOSTLY CLR",
+}
+
+
+def short_desc(desc):
+    """Shorten a weather description to fit 11 chars."""
+    if len(desc) <= 11:
+        return desc
+    return DESC_SHORT.get(desc, desc[:11])
+
+
 def generate_content(weather_data=None):
     if weather_data:
         today_date = datetime.strptime(weather_data["daily"]["time"][0], "%Y-%m-%d")
@@ -98,36 +147,48 @@ def generate_content(weather_data=None):
         today_date = datetime.now()
         tomorrow_date = today_date + timedelta(days=1)
 
-    pages = [{
-        "lines": [
-            "",
-            today_date.strftime("%A").upper(),
-            f"{today_date.strftime('%B').upper()} {today_date.day}, {today_date.year}",
-            "",
-            "AUCKLAND, NZ",
-            "",
-        ]
-    }]
+    day_name = today_date.strftime("%A").upper()
+    date_str = f"{today_date.strftime('%B').upper()} {today_date.day}, {today_date.year}"
 
     if weather_data:
         daily = weather_data["daily"]
-        for i, (date, label) in enumerate([(today_date, "TODAY"), (tomorrow_date, "TOMORROW")]):
-            h = round(daily["temperature_2m_max"][i])
-            l = round(daily["temperature_2m_min"][i])
-            desc = WMO_CODES.get(daily["weathercode"][i], "UNKNOWN")
-            wind = round(daily["windspeed_10m_max"][i])
-            wdir = wind_direction_str(daily["winddirection_10m_dominant"][i])
-            rain = round(daily["precipitation_probability_max"][i])
-            short = date.strftime("%a %d %b").upper()
-            pages.append({
-                "lines": [
-                    f"{label}  {short}", "",
-                    f"HIGH {h}  LOW {l}", desc,
-                    f"WIND {wind} KM/H {wdir}", f"RAIN {rain}%",
-                ]
-            })
 
-    return {"pages": pages, "interval": 15000}
+        def weather_for(i):
+            return {
+                "high": round(daily["temperature_2m_max"][i]),
+                "low": round(daily["temperature_2m_min"][i]),
+                "desc": WMO_CODES.get(daily["weathercode"][i], "UNKNOWN"),
+                "wind": round(daily["windspeed_10m_max"][i]),
+                "wdir": wind_direction_str(daily["winddirection_10m_dominant"][i]),
+                "rain": round(daily["precipitation_probability_max"][i]),
+            }
+
+        t = weather_for(0)
+        m = weather_for(1)
+
+        lines = [
+            day_name,
+            date_str,
+            "AUCKLAND, NZ",
+            "",
+            side_by_side("TODAY", "TOMORROW"),
+            side_by_side(f"HIGH {t['high']}", f"HIGH {m['high']}"),
+            side_by_side(f"LOW {t['low']}", f"LOW {m['low']}"),
+            side_by_side(short_desc(t["desc"]), short_desc(m["desc"])),
+            side_by_side(f"{t['wind']}KM/H {t['wdir']}", f"{m['wind']}KM/H {m['wdir']}"),
+            side_by_side(f"RAIN {t['rain']}%", f"RAIN {m['rain']}%"),
+            "",
+        ]
+    else:
+        lines = [
+            day_name,
+            date_str,
+            "",
+            "AUCKLAND, NZ",
+            "", "", "", "", "", "", "",
+        ]
+
+    return {"pages": [{"lines": lines}], "interval": 999999}
 
 
 # --- HTTP Server ---
@@ -396,7 +457,7 @@ async def capture_screenshots(content, port=8765):
             if i > 0:
                 await page.evaluate("window.flipframe.nextPage()")
             await page.wait_for_function("!window.flipframe.isTransitioning()", timeout=15000)
-            await page.wait_for_timeout(800)
+            await page.wait_for_timeout(8000)
 
             filepath = OUTPUT_DIR / f"flipframe_{i + 1}.png"
             await page.screenshot(path=str(filepath))
@@ -445,7 +506,7 @@ def cmd_push(args):
             tv.delete_list(old_ids)
             time.sleep(1)
 
-        # Upload new screenshots
+        # Upload new screenshot(s)
         uploaded = []
         for ss in screenshots:
             print(f"  Uploading {ss.name}...")
@@ -453,16 +514,19 @@ def cmd_push(args):
             uploaded.append(cid)
             print(f"    → {cid}")
 
-        # Select first image and enable slideshow
+        # Select image as current art
         if uploaded:
             tv.select_image(uploaded[0])
             print(f"  Set {uploaded[0]} as current art")
 
-        if len(uploaded) > 1:
-            tv.set_slideshow(duration_min=1, shuffle=False)
-            print(f"  Slideshow enabled ({len(uploaded)} images, 1 min rotation)")
+        # Disable rotation if only one image
+        if len(uploaded) == 1:
+            try:
+                tv.set_slideshow(duration_min=0)
+            except Exception:
+                pass
 
-        print(f"\n✅ Done! {len(uploaded)} image(s) pushed to art mode.")
+        print(f"\n✅ Done! Pushed to art mode.")
     finally:
         tv.close()
 

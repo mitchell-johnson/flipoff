@@ -1,7 +1,7 @@
 import { Board } from './Board.js';
 import { GRID_COLS, TOTAL_TRANSITION } from './constants.js';
 
-const KIOSK_ROWS = 6;
+const KIOSK_ROWS = 11;
 const DEFAULT_INTERVAL = 15000;
 
 function getParams() {

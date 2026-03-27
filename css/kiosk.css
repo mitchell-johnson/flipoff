@@ -21,9 +21,9 @@ html, body {
   background: #111;
   border-radius: 0;
   box-shadow: none;
-  padding: 40px 60px;
-  --tile-size: clamp(80px, 7.5vh, 140px);
-  --tile-gap: 8px;
+  padding: 20px 40px;
+  --tile-size: clamp(50px, 7vh, 110px);
+  --tile-gap: 6px;
 }
 
 /* Hide board scroll indicator */
