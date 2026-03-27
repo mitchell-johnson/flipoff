@@ -581,11 +581,18 @@ def cmd_push(args):
     tv.connect()
 
     try:
-        # Ensure art mode is on (uploads fail silently when TV is in regular mode)
-        if not tv.get_artmode():
-            print("  Switching TV to art mode...")
-            tv.set_artmode(True)
-            time.sleep(3)
+        # Only force art mode if not in quiet mode
+        if not getattr(args, 'quiet', False):
+            if not tv.get_artmode():
+                print("  Switching TV to art mode...")
+                tv.set_artmode(True)
+                time.sleep(3)
+        else:
+            # In quiet mode, check if TV is reachable on art channel but don't switch modes
+            try:
+                tv.get_artmode()
+            except Exception:
+                pass
 
         # Clean up old flipframe uploads
         existing = tv.list_art()
@@ -604,7 +611,7 @@ def cmd_push(args):
             uploaded.append(cid)
             print(f"    → {cid}")
 
-        # Select image as current art
+        # Select image as current art (so it shows when art mode is next active)
         if uploaded:
             tv.select_image(uploaded[0])
             print(f"  Set {uploaded[0]} as current art")
@@ -616,7 +623,50 @@ def cmd_push(args):
             except Exception:
                 pass
 
-        print(f"\n✅ Done! Pushed to art mode.")
+        print(f"\n✅ Done! {'Quietly pushed' if getattr(args, 'quiet', False) else 'Pushed to art mode'}.")
+    finally:
+        tv.close()
+
+
+def cmd_artmode(args):
+    """Wake the TV and switch to art mode (no content generation)."""
+    import subprocess
+
+    # Wake-on-LAN — send magic packet to TV MAC
+    mac = "f4:fe:fb:ae:6b:64"
+    mac_bytes = bytes.fromhex(mac.replace(":", ""))
+    magic = b"\xff" * 6 + mac_bytes * 16
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        s.sendto(magic, ("255.255.255.255", 9))
+    print("Sent Wake-on-LAN packet")
+
+    # Wait for TV to be reachable
+    print(f"Waiting for TV at {args.tv_ip}...")
+    for i in range(args.timeout):
+        try:
+            with socket.create_connection((args.tv_ip, 8002), timeout=2):
+                break
+        except (ConnectionRefusedError, OSError, TimeoutError):
+            time.sleep(1)
+    else:
+        print(f"TV not reachable after {args.timeout}s — may already be in art mode or fully off")
+        sys.exit(1)
+
+    time.sleep(3)  # let websocket service stabilise
+
+    tv = FrameTVArt(args.tv_ip)
+    print(f"Connecting to TV at {args.tv_ip}...")
+    tv.connect()
+
+    try:
+        if tv.get_artmode():
+            print("Already in art mode ✅")
+        else:
+            print("Switching to art mode...")
+            tv.set_artmode(True)
+            time.sleep(2)
+            print("Art mode enabled ✅")
     finally:
         tv.close()
 
@@ -712,17 +762,22 @@ def main():
     push_p = sub.add_parser("push", help="Generate screenshots & push to TV art mode")
     push_p.add_argument("--tv-ip", default=DEFAULT_TV_IP, help=f"TV IP (default: {DEFAULT_TV_IP})")
     push_p.add_argument("--no-clean", dest="clean", action="store_false", help="Don't remove old uploads")
+    push_p.add_argument("--quiet", action="store_true", help="Upload without switching TV to art mode")
 
     live_p = sub.add_parser("live", help="Serve live animated display on TV browser")
     live_p.add_argument("--tv-ip", default=DEFAULT_TV_IP, help=f"TV IP (default: {DEFAULT_TV_IP})")
     live_p.add_argument("--port", type=int, default=8765, help="Port (default: 8765)")
+
+    art_p = sub.add_parser("artmode", help="Wake TV and switch to art mode (no content generation)")
+    art_p.add_argument("--tv-ip", default=DEFAULT_TV_IP, help=f"TV IP (default: {DEFAULT_TV_IP})")
+    art_p.add_argument("--timeout", type=int, default=30, help="Seconds to wait for TV (default: 30)")
 
     sub.add_parser("preview", help="Open in local browser")
     sub.add_parser("generate", help="Generate 4K screenshots to cli/output/")
 
     args = parser.parse_args()
 
-    cmds = {"push": cmd_push, "live": cmd_live, "preview": cmd_preview, "generate": cmd_generate}
+    cmds = {"push": cmd_push, "live": cmd_live, "artmode": cmd_artmode, "preview": cmd_preview, "generate": cmd_generate}
     if args.command in cmds:
         cmds[args.command](args)
     else:
