@@ -581,18 +581,25 @@ def cmd_push(args):
     tv.connect()
 
     try:
+        quiet_mode = getattr(args, "quiet", False)
+        artmode_on = False
+
         # Only force art mode if not in quiet mode
-        if not getattr(args, 'quiet', False):
-            if not tv.get_artmode():
+        if not quiet_mode:
+            artmode_on = tv.get_artmode()
+            if not artmode_on:
                 print("  Switching TV to art mode...")
                 tv.set_artmode(True)
                 time.sleep(3)
+                artmode_on = True
         else:
-            # In quiet mode, check if TV is reachable on art channel but don't switch modes
+            # In quiet mode, detect whether the TV is already showing art.
+            # If it's actively playing media, we'll queue the new image without displaying it.
             try:
-                tv.get_artmode()
-            except Exception:
-                pass
+                artmode_on = tv.get_artmode()
+            except Exception as e:
+                print(f"  Could not read art mode state ({e}) — staying non-intrusive")
+                artmode_on = False
 
         # Clean up old flipframe uploads
         existing = tv.list_art()
@@ -613,8 +620,12 @@ def cmd_push(args):
 
         # Select image as current art (so it shows when art mode is next active)
         if uploaded:
-            tv.select_image(uploaded[0])
-            print(f"  Set {uploaded[0]} as current art")
+            show_now = not quiet_mode or artmode_on
+            tv.select_image(uploaded[0], show=show_now)
+            if show_now:
+                print(f"  Set {uploaded[0]} as current art")
+            else:
+                print(f"  Queued {uploaded[0]} as the next art image (media left alone)")
 
         # Disable rotation if only one image
         if len(uploaded) == 1:

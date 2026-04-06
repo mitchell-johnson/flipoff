@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Watch Samsung Frame TV directly for power-off and switch to art mode.
+"""Watch Samsung Frame TV power state and switch to art mode when turned off.
 
-Polls the TV's websocket port (8002) to detect reachable → unreachable
-transitions. When the TV goes down, confirms with ICMP ping before acting —
-the Samsung Frame's port 8002 drops briefly during active use (WiFi blips),
-but the TV still responds to ping. Only if BOTH port 8002 AND ping fail
-does the watcher consider the TV truly off and send WoL to switch to art mode.
+Uses the TV's REST API (same approach as Home Assistant's Samsung TV integration)
+to reliably detect power state changes. Polls http(s)://{TV_IP}:8002/api/v2/ for
+device.PowerState — this is far more reliable than TCP port probing + ping,
+which can false-trigger during WiFi blips while the TV is actively in use.
+
+State detection flow:
+  1. Poll REST API every POLL_INTERVAL seconds
+  2. PowerState == "on" → TV is on, do nothing
+  3. PowerState != "on" or unreachable → start offline confirmation timer
+  4. If TV stays non-"on" for OFFLINE_CONFIRM seconds → send WoL + switch to art mode
 
 Also refreshes weather content every 30 minutes (quiet push — no mode switch).
 
@@ -13,6 +18,7 @@ Run as a launchd daemon — see com.flipframe.artmode-watcher.plist
 """
 
 import json
+import math
 import os
 import socket
 import ssl
@@ -20,163 +26,111 @@ import subprocess
 import sys
 import threading
 import time
-import uuid
-import base64
-
-import websocket
+import urllib.error
+import urllib.request
 
 # --- Config ---
 TV_IP = os.environ.get("FLIPFRAME_TV_IP", "192.168.1.81")
-TV_MAC = "f4:fe:fb:ae:6b:64"
+TV_MAC = os.environ.get("FLIPFRAME_TV_MAC", "f4:fe:fb:ae:6b:64")
 TV_PORT = 8002
 
-POLL_INTERVAL = 5          # seconds between reachability checks
-POLL_TIMEOUT = 3           # seconds to wait for TCP connect
-OFFLINE_CONFIRM = 30       # seconds TV must stay unreachable before we act
+POLL_INTERVAL = 10         # seconds between REST API checks (matches HA's SCAN_INTERVAL)
+OFFLINE_CONFIRM = 30       # seconds TV must stay non-"on" before we act
 WOL_ATTEMPTS = 5           # number of WoL packets to send
-WOL_RETRY_DELAY = 5        # seconds between WoL bursts
+WOL_RETRY_DELAY = 5        # seconds between WoL bursts (wall-clock)
 WAKE_TIMEOUT = 60          # max seconds to wait for TV to come back after WoL
 COOLDOWN_SECONDS = 120     # ignore repeated off→on cycles within this window
 ARTMODE_SETTLE = 15        # seconds to wait after TV reachable before art mode command
 ARTMODE_RETRIES = 3        # retry art mode if TV isn't fully ready yet
 ARTMODE_RETRY_DELAY = 10   # seconds between retries
 REFRESH_INTERVAL = 30 * 60 # 30 minutes
-
-PING_COUNT = 3             # pings to send for reachability check
-PING_TIMEOUT = 2           # seconds per ping
+REST_TIMEOUT = 5           # seconds for REST API request timeout
 
 TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tv-token")
 CLI_DIR = os.path.dirname(os.path.abspath(__file__))
 FLIPFRAME = os.path.join(CLI_DIR, "flipframe.py")
+
+# Thread safety: prevents watch loop and refresh loop from hitting the TV simultaneously
+_tv_lock = threading.Lock()
+
+# Cached REST API scheme (HTTPS or HTTP) — detected on first successful probe
+_rest_scheme = None
 
 
 def log(msg):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
-def tv_responds_to_ping():
-    """Check if the TV responds to ICMP ping.
+# --- REST API State Detection (Home Assistant approach) ---
 
-    The TV's network stack responds to ping even when port 8002 (websocket)
-    drops briefly during active use. If ping succeeds but port 8002 is down,
-    it's a WiFi blip — not a real power-off. If both fail, TV is truly off.
+def _make_ssl_context():
+    """Create a permissive SSL context for the TV's self-signed cert."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _probe_rest_url():
+    """Detect whether the TV serves REST API over HTTPS or HTTP. Cache the result."""
+    global _rest_scheme
+    if _rest_scheme:
+        return f"{_rest_scheme}://{TV_IP}:{TV_PORT}/api/v2/"
+
+    ctx = _make_ssl_context()
+    for scheme in ("https", "http"):
+        try:
+            url = f"{scheme}://{TV_IP}:{TV_PORT}/api/v2/"
+            req = urllib.request.Request(url, headers={"User-Agent": "FlipFrame/1.0"})
+            urllib.request.urlopen(req, timeout=3, context=ctx)
+            _rest_scheme = scheme
+            log(f"REST API detected at {scheme}://{TV_IP}:{TV_PORT}")
+            return url
+        except Exception:
+            continue
+
+    # Default to HTTPS if probe fails (TV may be off)
+    return f"https://{TV_IP}:{TV_PORT}/api/v2/"
+
+
+def get_tv_power_state():
+    """Query the TV's REST API for PowerState.
+
+    Returns:
+        "on" if TV is on and REST API reports PowerState as "on"
+        "off" if REST API is reachable but PowerState is not "on"
+        "unreachable" if REST API cannot be reached (TV is off or network issue)
+
+    This mirrors Home Assistant's SamsungTVWSBridge.async_is_on() which checks
+    device_info["device"]["PowerState"] == "on" as the primary detection method.
     """
+    rest_url = _probe_rest_url()
+    ctx = _make_ssl_context()
+
     try:
-        result = subprocess.run(
-            ["/sbin/ping", "-c", str(PING_COUNT), "-W", str(PING_TIMEOUT * 1000), TV_IP],
-            capture_output=True, text=True, timeout=PING_COUNT * PING_TIMEOUT + 5,
-        )
-        success = result.returncode == 0
-        if success:
-            # Extract round-trip time from output for logging
-            for line in result.stdout.splitlines():
-                if "avg" in line:
-                    log(f"  Ping OK: {line.strip()}")
-                    break
-            else:
-                log("  Ping OK")
-        return success
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
-        log(f"  Ping failed: {e}")
-        return False
+        req = urllib.request.Request(rest_url, headers={"User-Agent": "FlipFrame/1.0"})
+        with urllib.request.urlopen(req, timeout=REST_TIMEOUT, context=ctx) as resp:
+            data = json.loads(resp.read().decode())
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return "unreachable"
+    except (json.JSONDecodeError, ValueError) as e:
+        log(f"WARNING: REST API returned unparseable response: {e}")
+        return "unreachable"
+
+    power_state = data.get("device", {}).get("PowerState", "unknown")
+    return "on" if power_state == "on" else "off"
 
 
 def tv_is_reachable():
     """Check if the TV's websocket port is accepting connections."""
     try:
-        with socket.create_connection((TV_IP, TV_PORT), timeout=POLL_TIMEOUT):
+        with socket.create_connection((TV_IP, TV_PORT), timeout=3):
             return True
     except (ConnectionRefusedError, OSError, TimeoutError):
         return False
 
 
-def tv_is_in_use():
-    """Connect to TV and check if it's actively being used (not in art mode / standby).
-
-    Returns True if the TV appears to be in active use (don't switch to art mode).
-    Returns False if the TV is idle/art mode/unknown (safe to switch).
-    """
-    try:
-        token = ""
-        try:
-            with open(TOKEN_FILE) as f:
-                token = f.read().strip()
-        except OSError:
-            pass
-
-        name = base64.b64encode(b"SamsungTvRemote").decode()
-        url = f"wss://{TV_IP}:8002/api/v2/channels/com.samsung.art-app?name={name}"
-        if token:
-            url += f"&token={token}"
-
-        ws = websocket.create_connection(
-            url,
-            sslopt={"cert_reqs": ssl.CERT_NONE},
-            timeout=10,
-        )
-
-        # Drain connect/ready events
-        events_seen = set()
-        for _ in range(5):
-            try:
-                ws.settimeout(5)
-                data = json.loads(ws.recv())
-                events_seen.add(data.get("event", ""))
-                if "ms.channel.ready" in events_seen:
-                    break
-            except websocket.WebSocketTimeoutException:
-                break
-
-        if "ms.channel.ready" not in events_seen:
-            ws.close()
-            # Can't determine state — assume not in use (let art mode try)
-            return False
-
-        ws.settimeout(10)
-
-        # Check art mode status
-        req_id = str(uuid.uuid4())
-        ws.send(json.dumps({
-            "method": "ms.channel.emit",
-            "params": {
-                "event": "art_app_request",
-                "to": "host",
-                "data": json.dumps({
-                    "request": "get_artmode_status",
-                    "id": req_id,
-                    "request_id": req_id,
-                }),
-            }
-        }))
-
-        # Wait for response
-        for _ in range(10):
-            raw = ws.recv()
-            resp = json.loads(raw)
-            if resp.get("event") == "d2d_service_message":
-                d = json.loads(resp["data"])
-                if d.get("event") == "artmode_status" or d.get("request_id") == req_id:
-                    artmode_on = d.get("value") == "on"
-                    ws.close()
-                    if artmode_on:
-                        log("  TV is already in art mode")
-                        return False  # already art mode, safe to proceed
-                    else:
-                        log("  TV is NOT in art mode — something is active")
-                        return True  # TV is being used
-                if d.get("event") == "error":
-                    break
-
-        ws.close()
-        # Couldn't determine — assume not in use
-        return False
-
-    except Exception as e:
-        log(f"  Could not check TV state: {e}")
-        # If we can't connect to art channel, TV may be busy with an app
-        # Be conservative — assume in use
-        return True
-
+# --- WoL & Art Mode ---
 
 def send_wol(count=1):
     """Send Wake-on-LAN magic packet(s)."""
@@ -190,11 +144,10 @@ def send_wol(count=1):
 
 
 def make_env():
-    """Build environment with correct PATH/PYTHONPATH for subprocess calls."""
+    """Build environment with correct PATH for subprocess calls."""
     return {
         **os.environ,
         "PATH": f"/opt/homebrew/bin:{os.environ.get('PATH', '')}",
-        "PYTHONPATH": f"/Users/mitchell/Library/Python/3.14/lib/python/site-packages:{os.environ.get('PYTHONPATH', '')}",
     }
 
 
@@ -222,17 +175,20 @@ def switch_to_artmode():
 
 def quiet_push():
     """Regenerate weather content and push to TV without switching to art mode."""
-    if not tv_is_reachable():
+    state = get_tv_power_state()
+    if state == "unreachable":
         log("TV unreachable, skipping weather refresh (will retry next cycle)")
         return
     log("Refreshing weather content (quiet push)...")
     try:
-        result = subprocess.run(
-            [sys.executable, FLIPFRAME, "push", "--tv-ip", TV_IP, "--quiet"],
-            capture_output=True, text=True, timeout=120, env=make_env(),
-        )
+        with _tv_lock:
+            result = subprocess.run(
+                [sys.executable, FLIPFRAME, "push", "--tv-ip", TV_IP, "--quiet"],
+                capture_output=True, text=True, timeout=120, env=make_env(),
+            )
         if result.returncode == 0:
-            log(f"Weather refreshed: {result.stdout.strip().splitlines()[-1]}")
+            lines = result.stdout.strip().splitlines()
+            log(f"Weather refreshed: {lines[-1] if lines else '(no output)'}")
         else:
             log(f"Quiet push failed (exit {result.returncode}): {result.stderr.strip()}")
     except subprocess.TimeoutExpired:
@@ -256,120 +212,119 @@ def wait_for_tv(timeout=WAKE_TIMEOUT):
     """Send WoL and wait for TV to become reachable. Returns True if TV came up."""
     log(f"Sending WoL packets and waiting up to {timeout}s for TV...")
     deadline = time.time() + timeout
-    attempt = 0
+    next_wol = 0
 
     while time.time() < deadline:
-        if attempt % WOL_RETRY_DELAY == 0:
-            wol_round = (attempt // WOL_RETRY_DELAY) + 1
-            log(f"  WoL burst #{wol_round} ({WOL_ATTEMPTS} packets)")
+        now = time.time()
+        if now >= next_wol:
+            log(f"  WoL burst ({WOL_ATTEMPTS} packets)")
             send_wol(count=WOL_ATTEMPTS)
-
-        time.sleep(1)
-        attempt += 1
+            next_wol = now + WOL_RETRY_DELAY
 
         if tv_is_reachable():
-            log(f"  TV responded after {attempt}s")
+            elapsed = int(time.time() + timeout - deadline)
+            log(f"  TV responded after {elapsed}s")
             return True
+        time.sleep(1)
 
     log(f"  TV did not respond within {timeout}s")
     return False
 
 
 def confirm_offline(seconds=OFFLINE_CONFIRM):
-    """Confirm TV stays unreachable for the given duration.
+    """Confirm TV stays non-"on" for the given duration using REST API.
 
-    Returns True if TV stayed offline the entire time (real power-off).
-    Returns False if TV came back (was just a blip).
+    Returns True if TV stayed off the entire time (real power-off).
+    Returns False if TV came back to "on" state (was just a blip).
     """
-    log(f"  Confirming TV stays offline for {seconds}s...")
-    checks = seconds // POLL_INTERVAL
+    log(f"  Confirming TV stays off for {seconds}s...")
+    checks = math.ceil(seconds / POLL_INTERVAL)
     for i in range(checks):
         time.sleep(POLL_INTERVAL)
-        if tv_is_reachable():
-            log(f"  TV came back after {(i + 1) * POLL_INTERVAL}s — was just a blip, not a real power-off")
+        state = get_tv_power_state()
+        if state == "on":
+            elapsed = (i + 1) * POLL_INTERVAL
+            log(f"  TV came back to 'on' after {elapsed}s — was just a blip")
             return False
+        log(f"  Confirmation check {i + 1}/{checks}: state={state}")
     return True
 
 
+# --- Main Watch Loop ---
+
 def watch():
-    """Main polling loop — detect TV going offline and switch to art mode."""
-    log(f"Polling TV at {TV_IP}:{TV_PORT} every {POLL_INTERVAL}s")
+    """Main polling loop — detect TV power off via REST API and switch to art mode."""
+    rest_url = _probe_rest_url()
+    log(f"Polling TV REST API at {rest_url} every {POLL_INTERVAL}s")
     log(f"Offline confirmation: {OFFLINE_CONFIRM}s before acting")
 
-    was_reachable = tv_is_reachable()
+    prev_state = get_tv_power_state()
     last_artmode_time = 0
-    log(f"Initial state: {'reachable' if was_reachable else 'unreachable'}")
+    heartbeat_counter = 0
+    log(f"Initial state: {prev_state}")
 
     while True:
         time.sleep(POLL_INTERVAL)
+        heartbeat_counter += 1
 
-        is_reachable = tv_is_reachable()
+        # Hourly heartbeat log
+        if heartbeat_counter % 360 == 0:
+            log(f"Heartbeat: running, state={prev_state}")
 
-        # Detect transition: reachable → unreachable (TV may have turned off)
-        if was_reachable and not is_reachable:
+        state = get_tv_power_state()
+
+        # Detect transition: "on" → not "on" (TV may have been turned off)
+        if prev_state == "on" and state != "on":
             now = time.time()
-            log("TV went offline (reachable → unreachable)")
+            log(f"TV state changed: on → {state}")
 
             if now - last_artmode_time < COOLDOWN_SECONDS:
                 remaining = int(COOLDOWN_SECONDS - (now - last_artmode_time))
                 log(f"  Cooldown active ({remaining}s left), skipping")
-                was_reachable = is_reachable
+                prev_state = state
                 continue
 
-            # Wait to confirm this is a real power-off, not a momentary blip
+            # Confirm the TV stays off — filters out brief blips
             if not confirm_offline():
-                # TV came back on its own — someone is using it
-                was_reachable = tv_is_reachable()
+                prev_state = get_tv_power_state()
                 continue
 
-            # Ping check: if TV responds to ping, it's still on — just a port 8002 blip
-            if tv_responds_to_ping():
-                log("  TV responds to ping — port 8002 WiFi blip, not a real power-off")
-                was_reachable = tv_is_reachable()
-                continue
+            log("  TV confirmed off — attempting wake to art mode")
 
-            log("  TV confirmed offline (port 8002 down + ping failed) — attempting wake to art mode")
+            # TV has been off for OFFLINE_CONFIRM seconds — wake it
+            with _tv_lock:
+                if wait_for_tv():
+                    log(f"  Waiting {ARTMODE_SETTLE}s for art channel to stabilise...")
+                    time.sleep(ARTMODE_SETTLE)
 
-            # TV has been down for OFFLINE_CONFIRM seconds — wake it
-            if wait_for_tv():
-                log(f"  Waiting {ARTMODE_SETTLE}s for art channel to stabilise...")
-                time.sleep(ARTMODE_SETTLE)
+                    success = False
+                    for attempt in range(1, ARTMODE_RETRIES + 1):
+                        if switch_to_artmode():
+                            success = True
+                            break
+                        if attempt < ARTMODE_RETRIES:
+                            log(f"  Retry {attempt}/{ARTMODE_RETRIES} in {ARTMODE_RETRY_DELAY}s...")
+                            time.sleep(ARTMODE_RETRY_DELAY)
 
-                # Check if the TV was actively in use before switching
-                if tv_is_in_use():
-                    log("  TV is in active use — skipping art mode switch")
-                    is_reachable = tv_is_reachable()
-                    was_reachable = is_reachable
-                    continue
-
-                success = False
-                for attempt in range(1, ARTMODE_RETRIES + 1):
-                    if switch_to_artmode():
-                        success = True
-                        break
-                    if attempt < ARTMODE_RETRIES:
-                        log(f"  Retry {attempt}/{ARTMODE_RETRIES} in {ARTMODE_RETRY_DELAY}s...")
-                        time.sleep(ARTMODE_RETRY_DELAY)
-
-                if success:
-                    last_artmode_time = time.time()
-                    time.sleep(5)
-                    quiet_push()
+                    if success:
+                        last_artmode_time = time.time()
+                        time.sleep(5)
+                        quiet_push()
+                    else:
+                        log("  Art mode switch failed after all retries")
                 else:
-                    log("  Art mode switch failed after all retries")
-            else:
-                log("  Could not wake TV — WoL may be disabled or TV is fully powered off")
+                    log("  Could not wake TV — WoL may be disabled or TV is fully powered off")
 
-            is_reachable = tv_is_reachable()
+            state = get_tv_power_state()
 
-        elif not was_reachable and is_reachable:
-            log("TV came online (unreachable → reachable)")
+        elif prev_state != "on" and state == "on":
+            log(f"TV came online: {prev_state} → on")
 
-        was_reachable = is_reachable
+        prev_state = state
 
 
 def main():
-    log("FlipFrame art mode watcher starting (direct polling mode)")
+    log("FlipFrame art mode watcher starting (REST API polling mode)")
 
     refresh_thread = threading.Thread(target=refresh_loop, daemon=True)
     refresh_thread.start()
