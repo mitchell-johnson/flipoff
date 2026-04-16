@@ -50,8 +50,10 @@ TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tv-token
 CLI_DIR = os.path.dirname(os.path.abspath(__file__))
 FLIPFRAME = os.path.join(CLI_DIR, "flipframe.py")
 
-# Thread safety: prevents watch loop and refresh loop from hitting the TV simultaneously
-_tv_lock = threading.Lock()
+# Thread safety: prevents watch loop and refresh loop from hitting the TV simultaneously.
+# RLock is deliberate because the watch loop can call quiet_push() while it already holds
+# the lock after waking the TV into art mode.
+_tv_lock = threading.RLock()
 
 # Cached REST API scheme (HTTPS or HTTP) — detected on first successful probe
 _rest_scheme = None
