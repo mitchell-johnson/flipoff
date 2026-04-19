@@ -140,6 +140,7 @@ def fetch_weather():
             "windspeed_10m_max", "winddirection_10m_dominant",
             "precipitation_probability_max",
         ]),
+        "hourly": "weathercode",
         "timezone": TIMEZONE, "forecast_days": 2,
     })
     url = f"https://api.open-meteo.com/v1/forecast?{params}"
@@ -153,6 +154,7 @@ CONTENT_COLS = 22
 CONTENT_ROWS = 12
 GRID_COLS = 30
 GRID_ROWS = 17
+HOURLY_FORECAST_HOURS = (6, 9, 15, 18)
 
 
 def pad_center(text, width):
@@ -168,6 +170,16 @@ def side_by_side(left, right, col_width=11):
     l = pad_center(left[:col_width], col_width)
     r = pad_center(right[:col_width], col_width)
     return l + r
+
+
+def format_forecast_slots(values, cell_width=2, spacer=" "):
+    """Lay out forecast values in evenly spaced fixed-width slots."""
+    return spacer.join(value[:cell_width].ljust(cell_width) for value in values)
+
+
+def format_forecast_icon_time_slots(icons, hours, spacer=""):
+    """Lay out icon+time pairs in evenly spaced slots on one row."""
+    return spacer.join(f"{icon}{forecast_hour_label(hour)}" for icon, hour in zip(icons, hours))
 
 
 # Abbreviations for weather descriptions that exceed 11 chars
@@ -223,54 +235,78 @@ def pad_to_grid(lines, content_cols, grid_cols, grid_rows):
     return padded[:grid_rows]
 
 
-def generate_content(weather_data=None):
-    if weather_data:
-        today_date = datetime.strptime(weather_data["daily"]["time"][0], "%Y-%m-%d")
-        tomorrow_date = datetime.strptime(weather_data["daily"]["time"][1], "%Y-%m-%d")
-    else:
-        today_date = datetime.now()
-        tomorrow_date = today_date + timedelta(days=1)
+def forecast_hour_label(hour):
+    """Render forecast hours in compact 12-hour format."""
+    hour_12 = hour % 12
+    return str(hour_12 or 12)
+
+
+def hourly_forecast_rows(date_str, hourly_data, hours=HOURLY_FORECAST_HOURS):
+    """Build a compact icon+time row for selected hours on a given day."""
+    codes_by_hour = {}
+
+    for time_str, code in zip(hourly_data.get("time", []), hourly_data.get("weathercode", [])):
+        try:
+            dt = datetime.fromisoformat(time_str)
+        except ValueError:
+            continue
+
+        if dt.strftime("%Y-%m-%d") == date_str and dt.hour in hours and dt.hour not in codes_by_hour:
+            codes_by_hour[dt.hour] = WMO_ICONS.get(code, ICON_OVERCAST)
+
+    icons = [codes_by_hour.get(hour, " ") for hour in hours]
+    return format_forecast_icon_time_slots(icons, hours)
+
+
+def build_weather_lines(weather_data):
+    daily = weather_data["daily"]
+    hourly = weather_data.get("hourly", {})
+
+    today_date = datetime.strptime(daily["time"][0], "%Y-%m-%d")
+
+    def weather_for(i):
+        return {
+            "high": round(daily["temperature_2m_max"][i]),
+            "low": round(daily["temperature_2m_min"][i]),
+            "desc": WMO_CODES.get(daily["weathercode"][i], "UNKNOWN"),
+            "wind": round(daily["windspeed_10m_max"][i]),
+            "wdir": wind_direction_str(daily["winddirection_10m_dominant"][i]),
+            "rain": round(daily["precipitation_probability_max"][i]),
+        }
+
+    today = weather_for(0)
+    tomorrow = weather_for(1)
 
     day_name = today_date.strftime("%A").upper()
     date_str = f"{today_date.strftime('%B').upper()} {today_date.day}, {today_date.year}"
 
+    today_forecast = hourly_forecast_rows(daily["time"][0], hourly)
+    tomorrow_forecast = hourly_forecast_rows(daily["time"][1], hourly)
+
+    return [
+        day_name,
+        date_str,
+        LOCATION_NAME,
+        "",
+        "",
+        side_by_side("TODAY", "TOMORROW"),
+        side_by_side(f"HIGH {temp_str(today['high'])}", f"HIGH {temp_str(tomorrow['high'])}"),
+        side_by_side(f"LOW {temp_str(today['low'])}", f"LOW {temp_str(tomorrow['low'])}"),
+        side_by_side(short_desc(today["desc"]), short_desc(tomorrow["desc"])),
+        side_by_side(f"{today['wind']}KM/H {today['wdir']}", f"{tomorrow['wind']}KM/H {tomorrow['wdir']}"),
+        side_by_side(f"RAIN {today['rain']}%", f"RAIN {tomorrow['rain']}%"),
+        side_by_side(today_forecast, tomorrow_forecast),
+    ]
+
+
+def generate_content(weather_data=None):
     if weather_data:
-        daily = weather_data["daily"]
-
-        def weather_for(i):
-            return {
-                "high": round(daily["temperature_2m_max"][i]),
-                "low": round(daily["temperature_2m_min"][i]),
-                "desc": WMO_CODES.get(daily["weathercode"][i], "UNKNOWN"),
-                "wind": round(daily["windspeed_10m_max"][i]),
-                "wdir": wind_direction_str(daily["winddirection_10m_dominant"][i]),
-                "rain": round(daily["precipitation_probability_max"][i]),
-            }
-
-        t = weather_for(0)
-        m = weather_for(1)
-
-        # Get weather icon characters
-        t_icon = WMO_ICONS.get(daily["weathercode"][0], ICON_OVERCAST)
-        m_icon = WMO_ICONS.get(daily["weathercode"][1], ICON_OVERCAST)
-
-        lines = [
-            day_name,
-            date_str,
-            LOCATION_NAME,
-            "",
-            side_by_side(t_icon, m_icon),
-            side_by_side("TODAY", "TOMORROW"),
-            side_by_side(f"HIGH {temp_str(t['high'])}", f"HIGH {temp_str(m['high'])}"),
-            side_by_side(f"LOW {temp_str(t['low'])}", f"LOW {temp_str(m['low'])}"),
-            side_by_side(short_desc(t["desc"]), short_desc(m["desc"])),
-            side_by_side(f"{t['wind']}KM/H {t['wdir']}", f"{m['wind']}KM/H {m['wdir']}"),
-            side_by_side(f"RAIN {t['rain']}%", f"RAIN {m['rain']}%"),
-        ]
+        lines = build_weather_lines(weather_data)
     else:
+        today_date = datetime.now()
         lines = [
-            day_name,
-            date_str,
+            today_date.strftime("%A").upper(),
+            f"{today_date.strftime('%B').upper()} {today_date.day}, {today_date.year}",
             "",
             LOCATION_NAME,
             "", "", "", "", "", "", "",
